@@ -19,19 +19,14 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "../docs")));
 
 /* ================= DATABASE ================= */
-const { Pool } = require("pg");
-
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
+  ssl: { rejectUnauthorized: false }
 });
 
 pool.connect()
   .then(() => console.log("✅ Postgres connected successfully"))
   .catch(err => console.error("❌ Postgres connection error:", err));
-
 
 /* ================= EMAIL ================= */
 const transporter = nodemailer.createTransport({
