@@ -3,7 +3,7 @@ console.log("🔥 SERVER FILE ACTUALLY RUNNING 🔥");
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const mysql = require("mysql2");
+const { Pool } = require("pg");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
@@ -16,23 +16,21 @@ app.use(cors());
 app.use(express.json());
 
 /* ================= FRONTEND ================= */
-app.use(express.static(path.join(__dirname, "../frontend")));
+app.use(express.static(path.join(__dirname, "../docs")));
 
 /* ================= DATABASE ================= */
-const db = mysql.createConnection({
+const pool = new Pool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT,
+  ssl: { rejectUnauthorized: false }
 });
 
-db.connect(err => {
-  if (err) {
-    console.log("❌ MySQL Error:", err);
-    process.exit(1);
-  }
-  console.log("✅ MySQL Connected");
-});
+pool.query("SELECT 1")
+  .then(() => console.log("✅ Postgres Connected"))
+  .catch(err => console.error("❌ Postgres Error:", err.message));
 
 /* ================= EMAIL ================= */
 const transporter = nodemailer.createTransport({
@@ -43,25 +41,16 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-transporter.verify(err => {
-  if (err) console.log("❌ EMAIL ERROR:", err);
-  else console.log("✅ EMAIL SERVER READY");
-});
-
-/* ================= AUTH MIDDLEWARE ================= */
+/* ================= AUTH ================= */
 function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader)
-    return res.status(401).json({ message: "Token missing ❌" });
-
-  const token = authHeader.split(" ")[1];
+  if (!authHeader) return res.status(401).json({ message: "Token missing ❌" });
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded;
+    req.user = jwt.verify(authHeader.split(" ")[1], process.env.JWT_SECRET);
     next();
   } catch {
-    return res.status(401).json({ message: "Invalid token ❌" });
+    res.status(401).json({ message: "Invalid token ❌" });
   }
 }
 
@@ -78,124 +67,80 @@ app.get("/health", (req, res) => {
 
 /* ================= REGISTER ================= */
 app.post("/register", async (req, res) => {
-  const { name, email, password } = req.body;
+  try {
+    const { name, email, password } = req.body;
+    const hashed = await bcrypt.hash(password, 10);
 
-  if (!name || !email || !password)
-    return res.status(400).json({ message: "All fields required ❌" });
+    await pool.query(
+      "INSERT INTO users (name,email,password,role) VALUES ($1,$2,$3,'user')",
+      [name, email, hashed]
+    );
 
-  const hashed = await bcrypt.hash(password, 10);
-
-  db.query(
-    "INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, 'user')",
-    [name, email, hashed],
-    err => {
-      if (err)
-        return res.status(409).json({ message: "User already exists ❌" });
-      res.json({ message: "Registered successfully ✅" });
-    }
-  );
+    res.json({ message: "Registered successfully ✅" });
+  } catch {
+    res.status(409).json({ message: "User already exists ❌" });
+  }
 });
 
 /* ================= LOGIN ================= */
-app.post("/login", (req, res) => {
+app.post("/login", async (req, res) => {
   const { email, password } = req.body;
 
-  db.query("SELECT * FROM users WHERE email=?", [email], async (err, rows) => {
-    if (err)
-      return res.status(500).json({ message: "Database error ❌" });
+  const result = await pool.query(
+    "SELECT * FROM users WHERE email=$1",
+    [email]
+  );
 
-    if (rows.length === 0)
-      return res.status(401).json({ message: "User not found ❌" });
+  if (result.rows.length === 0)
+    return res.status(401).json({ message: "User not found ❌" });
 
-    const user = rows[0];
-    const match = await bcrypt.compare(password, user.password);
+  const user = result.rows[0];
+  const match = await bcrypt.compare(password, user.password);
 
-    if (!match)
-      return res.status(401).json({ message: "Wrong password ❌" });
+  if (!match)
+    return res.status(401).json({ message: "Wrong password ❌" });
 
-    const token = jwt.sign(
-      { id: user.id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: "1h" }
-    );
+  const token = jwt.sign(
+    { id: user.id, role: user.role },
+    process.env.JWT_SECRET,
+    { expiresIn: "1h" }
+  );
 
-    res.json({ message: "Login success ✅", token, role: user.role });
-  });
+  res.json({ message: "Login success ✅", token, role: user.role });
 });
 
 /* ================= REQUEST CALL ================= */
-app.post("/request-call", (req, res) => {
+app.post("/request-call", async (req, res) => {
   const { name, phone, pickup, drop, cargo } = req.body;
 
-  if (!name || !phone)
-    return res.status(400).json({ message: "Name & phone required ❌" });
-
-  db.query(
+  await pool.query(
     `INSERT INTO request_calls
      (name, phone, pickup, drop_location, cargo, status)
-     VALUES (?, ?, ?, ?, ?, 'New')`,
-    [name, phone, pickup || "", drop || "", cargo || ""],
-    err => {
-      if (err)
-        return res.status(500).json({ message: "Server error ❌" });
-
-      transporter.sendMail({
-        from: `"Bais Express Logistics" <${process.env.EMAIL_USER}>`,
-        to: process.env.EMAIL_USER,
-        subject: "🚛 New Transport Request",
-        html: `
-          <p><b>Name:</b> ${name}</p>
-          <p><b>Phone:</b> ${phone}</p>
-          <p><b>Pickup:</b> ${pickup}</p>
-          <p><b>Drop:</b> ${drop}</p>
-          <p><b>Cargo:</b> ${cargo}</p>
-        `
-      });
-
-      res.json({ message: "Request sent successfully ✅" });
-    }
+     VALUES ($1,$2,$3,$4,$5,'New')`,
+    [name, phone, pickup || "", drop || "", cargo || ""]
   );
-});
 
-/* ================= ADMIN ROUTES ================= */
-app.get("/admin/requests", verifyToken, adminOnly, (req, res) => {
-  db.query("SELECT * FROM request_calls ORDER BY id DESC", (err, rows) => {
-    if (err)
-      return res.status(500).json({ message: "Database error ❌" });
-    res.json(rows);
+  await transporter.sendMail({
+    from: `"Bais Express Logistics" <${process.env.EMAIL_USER}>`,
+    to: process.env.EMAIL_USER,
+    subject: "🚛 New Transport Request",
+    html: `<p>${name} | ${phone}</p>`
   });
+
+  res.json({ message: "Request sent successfully ✅" });
 });
 
-app.put("/admin/request/:id", verifyToken, adminOnly, (req, res) => {
-  db.query(
-    "UPDATE request_calls SET status=? WHERE id=?",
-    [req.body.status, req.params.id],
-    err => {
-      if (err)
-        return res.status(500).json({ message: "Update failed ❌" });
-      res.json({ message: "Status updated ✅" });
-    }
+/* ================= ADMIN ================= */
+app.get("/admin/requests", verifyToken, adminOnly, async (req, res) => {
+  const result = await pool.query(
+    "SELECT * FROM request_calls ORDER BY id DESC"
   );
+  res.json(result.rows);
 });
 
-app.delete("/admin/request/:id", verifyToken, adminOnly, (req, res) => {
-  db.query(
-    "DELETE FROM request_calls WHERE id=?",
-    [req.params.id],
-    err => {
-      if (err)
-        return res.status(500).json({ message: "Delete failed ❌" });
-      res.json({ message: "Deleted successfully ✅" });
-    }
-  );
-});
-
-/* ================= FORGOT PASSWORD (FINAL FIX) ================= */
+/* ================= PASSWORD RESET ================= */
 app.post("/forgot-password", async (req, res) => {
   const { email } = req.body;
-
-  if (!email)
-    return res.status(400).json({ message: "Email required ❌" });
 
   const token = jwt.sign({ email }, process.env.RESET_SECRET, {
     expiresIn: "15m"
@@ -203,53 +148,32 @@ app.post("/forgot-password", async (req, res) => {
 
   const link = `${process.env.FRONTEND_URL}/reset.html?token=${token}`;
 
-  try {
-    await transporter.sendMail({
-      from: `"Bais Express Logistics" <${process.env.EMAIL_USER}>`,
-      to: email,
-      subject: "🔐 Reset Password",
-      html: `
-        <p>Hello,</p>
-        <p>Click the link below to reset your password:</p>
-        <a href="${link}">${link}</a>
-        <p>This link is valid for 15 minutes.</p>
-      `
-    });
+  await transporter.sendMail({
+    from: `"Bais Express Logistics" <${process.env.EMAIL_USER}>`,
+    to: email,
+    subject: "Reset Password",
+    html: `<a href="${link}">${link}</a>`
+  });
 
-    res.json({ message: "Reset link sent to email ✅" });
-
-  } catch (error) {
-    console.error("❌ EMAIL SEND FAILED:", error);
-    res.status(500).json({
-      message: "Email sending failed ❌ (check email config)"
-    });
-  }
+  res.json({ message: "Reset link sent to email ✅" });
 });
 
 /* ================= RESET PASSWORD ================= */
 app.post("/reset-password", async (req, res) => {
   const { token, newPassword } = req.body;
+  const decoded = jwt.verify(token, process.env.RESET_SECRET);
+  const hashed = await bcrypt.hash(newPassword, 10);
 
-  try {
-    const decoded = jwt.verify(token, process.env.RESET_SECRET);
-    const hashed = await bcrypt.hash(newPassword, 10);
+  await pool.query(
+    "UPDATE users SET password=$1 WHERE email=$2",
+    [hashed, decoded.email]
+  );
 
-    db.query(
-      "UPDATE users SET password=? WHERE email=?",
-      [hashed, decoded.email],
-      err => {
-        if (err)
-          return res.status(500).json({ message: "Reset failed ❌" });
-        res.json({ message: "Password reset successful ✅" });
-      }
-    );
-  } catch {
-    res.status(400).json({ message: "Token expired or invalid ❌" });
-  }
+  res.json({ message: "Password reset successful ✅" });
 });
 
 /* ================= START ================= */
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log("🚀 Server running on port", PORT);
 });
